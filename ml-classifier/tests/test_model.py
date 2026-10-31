@@ -9,10 +9,11 @@ from pathlib import Path
 
 import numpy as np
 import sklearn
-from model import ModelArtifact, create_model, load_model, save_model
-from schema import FEATURE_NAMES
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
+
+from model import ModelArtifact, create_model, load_model, save_model
+from schema import FEATURE_NAMES
 
 
 class CreateModelTests(unittest.TestCase):
@@ -26,7 +27,10 @@ class CreateModelTests(unittest.TestCase):
                 self.assertEqual(params["criterion"], "entropy")
                 self.assertIsNone(params["class_weight"])
                 self.assertEqual(params["random_state"], seed)
-                self.assertIsNone(params["max_depth"])
+                self.assertEqual(params["max_depth"], 10)
+                self.assertEqual(params["min_samples_split"], 2)
+                self.assertEqual(params["min_samples_leaf"], 1)
+                self.assertEqual(params["max_features"], "sqrt")
                 self.assertFalse(hasattr(estimator, "estimators_"))
         self.assertEqual(create_model().random_state, 0)
 
