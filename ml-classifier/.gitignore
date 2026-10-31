@@ -224,3 +224,6 @@ __marimo__/
 
 # Dataset
 dns_dataset/
+
+# Generated model artifacts and reports
+runs/
