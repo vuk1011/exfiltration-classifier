@@ -6,9 +6,14 @@ import math
 from pathlib import Path
 
 import numpy as np
-from dataset import Dataset, DatasetError
-from schema import FEATURE_NAMES, DatasetRow
 from sklearn.model_selection import train_test_split
+
+if __package__:
+    from .dataset import Dataset, DatasetError
+    from .schema import FEATURE_NAMES, DatasetRow
+else:
+    from dataset import Dataset, DatasetError
+    from schema import FEATURE_NAMES, DatasetRow
 
 SPLIT_NAMES = ("train", "validation", "test")
 

@@ -7,8 +7,12 @@ from itertools import combinations
 from time import perf_counter
 
 import numpy as np
-from schema import FEATURE_NAMES, DatasetRow
 from sklearn.metrics import confusion_matrix
+
+if __package__:
+    from .schema import FEATURE_NAMES, DatasetRow
+else:
+    from schema import FEATURE_NAMES, DatasetRow
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:

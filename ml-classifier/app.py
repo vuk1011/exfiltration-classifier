@@ -5,7 +5,10 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from dataset import DatasetError, load_dataset
+if __package__:
+    from .dataset import DatasetError, load_dataset
+else:
+    from dataset import DatasetError, load_dataset
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     train_parser.add_argument(
         "--reuse-splits", type=Path,
-        help="Load stored row assignments; source bytes, sample, seed, and fractions must match",
+        help="Load stored row assignments; source metadata, sample, seed, and fractions must match",
     )
     train_parser.add_argument(
         "--error-limit", type=int, default=10,
@@ -92,7 +95,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "train":
-            from training import train_baseline
+            if __package__:
+                from .training import train_baseline
+            else:
+                from training import train_baseline
 
             report = train_baseline(
                 args.path,
@@ -107,7 +113,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2))
             return 0
         if args.command == "evaluate":
-            from training import evaluate_file, write_report
+            if __package__:
+                from .training import evaluate_file, write_report
+            else:
+                from training import evaluate_file, write_report
 
             report = evaluate_file(
                 args.path,

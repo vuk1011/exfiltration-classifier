@@ -1,9 +1,9 @@
 # DNS exfiltration classifier
 
-Validate the published DNS exfiltration CSVs, inspect reproducible samples, train
-a random-forest baseline, and evaluate saved models. Inputs are the nine
-**precomputed single-request features**, not raw DNS queries. These tools do not
-extract features from DNS traffic.
+Classify a single DNS request using a trained random forest. The library accepts
+**nine named features**, or a `DNSQuery` object with a caller-supplied feature
+extractor. It also provides tools for CSV validation, sampling, training, and
+evaluation. DNS parsing and feature extraction are not bundled.
 
 ## Requirements
 
@@ -22,9 +22,145 @@ If the local environment is missing or incompatible with your OS, recreate it
 with `python3 -m venv .` and install the dependencies above. The explicit
 `./bin/python` commands below use that interpreter without activation.
 
-Download the
+For training and CSV inspection, download the
 [DNS Exfiltration Dataset](https://data.mendeley.com/datasets/c4n7fckkz3/3)
-and place the CSVs in `dns_dataset/`, or supply another file path.
+and place the CSVs in `dns_dataset/`, or supply another file path. The dataset is
+**not required for inference**.
+
+## Install and deploy
+
+Install from this source directory into your application's Python environment:
+
+```sh
+python3 -m pip install .
+```
+
+To deploy without copying the source tree or dataset, build a wheel from
+`ml-classifier/`:
+
+```sh
+./bin/python -m pip install setuptools wheel
+./bin/python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
+```
+
+Copy these two files to the receiving machine:
+
+- `dist/dns_exfiltration_classifier-0.1.0-py3-none-any.whl`
+- `runs/baseline/model.pkl`
+
+Then install the wheel in the receiving application's environment:
+
+```sh
+python3 -m pip install dns_exfiltration_classifier-0.1.0-py3-none-any.whl
+```
+
+Pip installs the pinned runtime dependencies. Use Python 3.12 or newer. The model
+loader requires the same scikit-learn version as the saved artifact; matching the
+pinned NumPy version is also recommended. Platform-specific dependency wheels
+must be available for the receiving machine.
+
+The existing baseline pickle is supported without conversion or retraining.
+The wheel contains library code, not datasets, model artifacts, tests, or the
+source machine's virtual environment. Neither `splits.json` nor `report.json` is
+needed to classify a request. Load only model files you trust: pickle loading can
+execute arbitrary code.
+
+## Inference API
+
+### Named features
+
+```python
+import json
+
+from dns_exfiltration_classifier import DNSClassifier
+
+classifier = DNSClassifier.load("model.pkl")
+
+features = {
+    "len": 6,
+    "subdomains_count": 1,
+    "w_count": 2,
+    "w_max": 3,
+    "entropy": 2.584962500721156,
+    "w_max_ratio": 0.5,
+    "w_count_ratio": 1 / 3,
+    "digits_ratio": 0.0,
+    "uppercase_ratio": 0.0,
+}
+result = classifier.classify(features)
+print(result.is_attack, result.score)
+print(json.dumps(result.to_dict()))
+```
+
+Load the model once and reuse the classifier. A mapping must contain exactly the
+nine feature names; insertion order does not matter. Values must be finite real
+numbers, not booleans or numeric strings. No scaling, normalization, or training
+occurs during classification.
+
+### DNS query objects
+
+Python's standard library has no DNS query message type. This library supplies a
+small immutable `DNSQuery(name, record_type="A")` dataclass. It preserves name case
+and trailing dots verbatim; it does not parse wire packets, resolve names, strip
+domains, or validate DNS syntax beyond nonempty strings.
+
+Supply your independently implemented extractor when loading the model:
+
+```python
+from dns_exfiltration_classifier import DNSClassifier, DNSQuery
+
+# extract_features is your implementation: DNSQuery -> mapping of nine features.
+classifier = DNSClassifier.load("model.pkl", feature_extractor=extract_features)
+query = DNSQuery(name="encoded.example.test.", record_type="TXT")
+result = classifier.classify(query)
+```
+
+The callback receives the query object once. Its returned mapping is validated
+and classified through the same path as direct features. You may pass a feature
+mapping to this classifier as well; doing so bypasses the callback. Convert a
+question from your DNS parser into `DNSQuery` at your application's boundary.
+
+**An extractor is required for query input.** The library does not guess entropy,
+word matching, or base-domain removal. Your extractor must match the training
+semantics for all nine features, including case, punctuation, dictionary behavior,
+and label removal. Matching feature names alone is not proof of compatibility.
+
+### Parameters and results
+
+`DNSClassifier.load(path, *, threshold=0.5, feature_extractor=None)` loads a trusted
+artifact and checks its feature schema. `classify(value, *, feature_schema=FEATURE_SCHEMA)`
+accepts a feature mapping or `DNSQuery`. The public `FEATURE_SCHEMA` identifier is
+`published_precomputed_single_request_v1`; mismatches are rejected. This identifier
+checks the declared contract, not the correctness of your extraction implementation.
+
+`Prediction` contains:
+
+- `score`: the random forest's score for the attack class, **not a calibrated risk
+  probability or confidence guarantee**.
+- `threshold` and `is_attack`: attack is strictly `score > threshold`. The default
+  `0.5` agrees with the forest's normal decision rule; a score equal to the
+  threshold is benign. Custom thresholds must be finite and in `[0, 1]`, and are
+  policy choices, not automatically validated settings.
+- `features`: an immutable mapping in canonical feature order.
+- `feature_schema` and `artifact_format_version`: contract/serialization versions,
+  not a unique identifier for a particular training run.
+- `query`: the original `DNSQuery` when supplied, otherwise `None`.
+
+Use `result.to_dict()` for an independent, JSON-safe copy. The classifier exposes
+`feature_names`, `feature_schema`, and `threshold` properties.
+
+### Invalid inputs
+
+- `InvalidFeaturesError`: missing/extra features, invalid values, or a mismatched
+  declared feature schema.
+- `FeatureExtractionError`: query input without an extractor, or an extractor
+  exception. The original exception is available as `__cause__`.
+- `ModelArtifactError`: an incompatible artifact or invalid estimator output.
+
+These exceptions are exported from `dns_exfiltration_classifier`. Invalid input
+never becomes a benign prediction: the caller must decide how to handle errors.
+File-access failures and corrupt pickle errors also propagate; compatibility
+checks do not make untrusted artifacts safe.
 
 ## Command-line usage
 
@@ -167,7 +303,9 @@ partial report JSON on stdout. Unexpected programming errors are not hidden.
 
 ## Python API
 
-Run Python from this directory so the local modules are importable:
+For dataset tooling, the existing flat imports work when Python runs from this
+directory. When installed, use `dns_exfiltration_classifier.dataset` and
+`dns_exfiltration_classifier.schema` instead:
 
 ```python
 from dataset import load_dataset
@@ -256,7 +394,10 @@ Original and modified datasets can be loaded independently.
 ```
 
 Tests use temporary synthetic CSVs; downloading the dataset is not required.
-CLI training/evaluation dispatch tests mock the flat `training` module APIs, so
+Read-only checks of the existing baseline are skipped when its pickle is absent.
+Wheel-installation tests require `setuptools` and `wheel`; they install into a
+temporary directory and check imports outside the source checkout without network
+access. CLI training/evaluation dispatch tests mock the flat `training` APIs, so
 those tests do not need real training artifacts:
 
 ```sh

@@ -8,16 +8,29 @@ from time import perf_counter
 
 import numpy as np
 import sklearn
-from dataset import Dataset, DatasetError, load_dataset
-from evaluation import audit_split_overlap, evaluate_model
-from model import create_model, load_model, save_model
-from schema import FEATURE_NAMES
-from splits import (
-    create_splits,
-    describe_source,
-    restore_splits,
-    validate_split_settings,
-)
+
+if __package__:
+    from .dataset import Dataset, DatasetError, load_dataset
+    from .evaluation import audit_split_overlap, evaluate_model
+    from .model import create_model, load_model, save_model
+    from .schema import FEATURE_NAMES
+    from .splits import (
+        create_splits,
+        describe_source,
+        restore_splits,
+        validate_split_settings,
+    )
+else:
+    from dataset import Dataset, DatasetError, load_dataset
+    from evaluation import audit_split_overlap, evaluate_model
+    from model import create_model, load_model, save_model
+    from schema import FEATURE_NAMES
+    from splits import (
+        create_splits,
+        describe_source,
+        restore_splits,
+        validate_split_settings,
+    )
 
 BASELINE_LIMITATION = (
     "Stratified random row split, not a session- or domain-held-out evaluation. "

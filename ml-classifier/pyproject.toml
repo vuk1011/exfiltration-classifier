@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dns-exfiltration-classifier"
+version = "0.1.0"
+description = "DNS exfiltration classification from precomputed request features"
+requires-python = ">=3.12"
+dependencies = [
+    "scikit-learn==1.9.1",
+    "numpy==2.5.4",
+]
+
+[project.scripts]
+dns-exfiltration = "dns_exfiltration_classifier.app:main"
+
+[tool.setuptools]
+packages = ["dns_exfiltration_classifier"]
+package-dir = {"dns_exfiltration_classifier" = "."}
+include-package-data = false

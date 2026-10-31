@@ -12,10 +12,14 @@ from pathlib import Path
 
 import numpy as np
 import sklearn
-from schema import FEATURE_NAMES
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.exceptions import NotFittedError
 from sklearn.utils.validation import check_is_fitted
+
+if __package__:
+    from .schema import FEATURE_NAMES
+else:
+    from schema import FEATURE_NAMES
 
 
 class ModelArtifactError(ValueError):
@@ -108,9 +112,20 @@ def save_model(
         pickle.dump(artifact, stream, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+class _ArtifactUnpickler(pickle.Unpickler):
+    """Resolve historical artifact names, not restrict trusted pickle execution."""
+
+    def find_class(self, module: str, name: str):
+        if name == "ModelArtifact" and module in (
+            "model", "dns_exfiltration_classifier.model",
+        ):
+            return ModelArtifact
+        return super().find_class(module, name)
+
+
 def load_model(path: str | Path) -> ModelArtifact:
     """Load and validate a TRUSTED LOCAL pickle, never an untrusted upload."""
     with Path(path).open("rb") as stream:
-        artifact = pickle.load(stream)
+        artifact = _ArtifactUnpickler(stream).load()
     _validate_artifact(artifact)
     return artifact

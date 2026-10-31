@@ -7,17 +7,30 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from schema import (
-    CSV_COLUMNS,
-    FEATURE_NAMES,
-    FEATURE_START,
-    FEATURE_STOP,
-    LABEL_INDEX,
-    ClassCounts,
-    DatasetRow,
-    DatasetSummary,
-    RequestMetadata,
-)
+if __package__:
+    from .schema import (
+        CSV_COLUMNS,
+        FEATURE_NAMES,
+        FEATURE_START,
+        FEATURE_STOP,
+        LABEL_INDEX,
+        ClassCounts,
+        DatasetRow,
+        DatasetSummary,
+        RequestMetadata,
+    )
+else:
+    from schema import (
+        CSV_COLUMNS,
+        FEATURE_NAMES,
+        FEATURE_START,
+        FEATURE_STOP,
+        LABEL_INDEX,
+        ClassCounts,
+        DatasetRow,
+        DatasetSummary,
+        RequestMetadata,
+    )
 
 
 class DatasetError(ValueError):
