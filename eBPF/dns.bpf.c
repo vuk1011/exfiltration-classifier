@@ -1,12 +1,8 @@
-// dns.bpf.c -- cgroup/skb EGRESS: hvata DNS upite NA IZLASKU IZ PODA.
-// Posto je program zakacen na cgroup konkretnog poda, identitet je uvek
-// taj pod (ne CoreDNS). Parsira ime domena iz UDP/53 paketa.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 
-#define ETH_HLEN 0            // cgroup_skb daje paket od IP headera (bez eth)
 #define DNS_HDR  12
 #define RAW_LEN  192
 #define NAME_LEN 180
@@ -17,8 +13,8 @@ struct event {
     __u64 cgroup_id;
     __u8  name[NAME_LEN];
     __u16 name_len;
-    __u8  qtype_txt;         // 1 ako je TXT upit (zadrzano za kompatibilnost)
-    __u16 qtype;            // pun QTYPE: 1=A, 28=AAAA, 16=TXT, 5=CNAME, 10=NULL, 15=MX...
+    __u8  qtype_txt;
+    __u16 qtype;
 };
 
 struct {
@@ -40,8 +36,6 @@ struct {
     __type(value, __u8[RAW_LEN]);
 } rawbuf SEC(".maps");
 
-// Mapa odluka za KARANTIN: kljuc = cgroup_id poda, value = 1 (blokiraj).
-// User space upisuje ovde kad detekcija oznaci pod. Kernel onda odbacuje.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
@@ -49,7 +43,6 @@ struct {
     __type(value, __u8);
 } quarantine SEC(".maps");
 
-// Dijagnostika: brojaci [0]=svi egress pozivi, [1]=UDP, [2]=DNS/53, [3]=poslato
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 4);
@@ -65,17 +58,16 @@ static __always_inline void bump(__u32 i){
 SEC("cgroup_skb/egress")
 int dns_egress(struct __sk_buff *skb)
 {
-    bump(0);                      // svaki egress poziv
-    // Samo IPv4
-    if (skb->family != 2)        // AF_INET = 2
+    bump(0);
+    if (skb->family != 2)
         return 1;
 
     struct iphdr iph;
     if (bpf_skb_load_bytes(skb, 0, &iph, sizeof(iph)) < 0)
         return 1;
-    if (iph.protocol != 17)             // UDP
+    if (iph.protocol != 17)
         return 1;
-    bump(1);                      // UDP
+    bump(1);
 
     __u32 ihl = iph.ihl * 4;
     struct udphdr udph;
@@ -83,11 +75,9 @@ int dns_egress(struct __sk_buff *skb)
         return 1;
     if (udph.dest != bpf_htons(53))
         return 1;
-    bump(2);                      // DNS
+    bump(2);
 
     __u64 cg = bpf_skb_cgroup_id(skb);
-
-    // KARANTIN: ako je ovaj pod oznacen, odbaci DNS paket (0 = drop).
     __u8 *blocked = bpf_map_lookup_elem(&quarantine, &cg);
     if (blocked && *blocked)
         return 0;
@@ -104,13 +94,10 @@ int dns_egress(struct __sk_buff *skb)
     ev->qtype_txt = 0;
     ev->qtype = 0;
 
-    __u32 dns_off = ihl + sizeof(struct udphdr);      // pocetak DNS poruke
-    __u32 qname_off = dns_off + DNS_HDR;               // pocetak imena
+    __u32 dns_off = ihl + sizeof(struct udphdr);
+    __u32 qname_off = dns_off + DNS_HDR;
 
     __builtin_memset(raw, 0, RAW_LEN);
-
-    // Jedan load_bytes, ali duzinu biramo prema stvarnoj velicini paketa.
-    // DNS upiti su kratki; fiksni RAW_LEN=192 pukne ako je paket manji.
     __u32 avail = (skb->len > qname_off) ? (skb->len - qname_off) : 0;
     if (avail == 0)
         return 1;
@@ -148,10 +135,6 @@ int dns_egress(struct __sk_buff *skb)
         i++;
     }
     ev->name_len = out;
-
-    // QTYPE je uvek poslednja 4 bajta pitanja: ... <ime> 00 QTYPE(2) QCLASS(2).
-    // Citamo sa KRAJA paketa (skb->len - 4), pa radi i za duga imena koja
-    // popune bafer (gde citanje posle imena ne bi stiglo do QTYPE-a).
     __u32 qlen = skb->len;
     if (qlen >= 4) {
         __u8 qt[2];
@@ -162,7 +145,7 @@ int dns_egress(struct __sk_buff *skb)
         }
     }
 
-    bump(3);                      // poslato u ringbuf
+    bump(3);
     bpf_ringbuf_output(&events, ev, sizeof(*ev), 0);
-    return 1;                           // propusti paket (monitoring mod)
+    return 1;
 }
