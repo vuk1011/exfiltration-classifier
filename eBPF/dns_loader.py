@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# dns_loader.py -- cgroup/skb egress monitoring + ML klasifikator.
-# SAMO MONITORING: karantin (dodavanje labele is_suspicious=true) je uklonjen.
 import os
 import sys
 import math
@@ -8,8 +5,6 @@ import ctypes
 import signal
 from collections import Counter
 
-# --- ML klasifikator (ml-classifier modul) ---
-# Dodaj putanju do ml-classifier paketa i ucitaj model.
 ML_DIR = os.environ.get("ML_DIR", os.path.join(os.path.dirname(__file__), "..", "ml-classifier"))
 MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(ML_DIR, "model.pkl"))
 THRESHOLD = float(os.environ.get("THRESHOLD", "0.5"))
@@ -27,7 +22,6 @@ try:
 except Exception as ex:
     print(f"[ml] WARNING: ML unavailable ({ex}); using fallback threshold")
 
-# --- CTYPES DEFINICIJE ZA STRUKTURE I LIBBPF ---
 NAME_LEN = 180
 
 class Event(ctypes.Structure):
@@ -60,36 +54,24 @@ libbpf.bpf_object__close.argtypes = [ctypes.c_void_p]
 libbpf.bpf_map_lookup_elem.restype = ctypes.c_int
 libbpf.bpf_map_lookup_elem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 
-# --- GLOBALNO STANJE ---
 KUBEPODS = "/sys/fs/cgroup/kubepods"
 pods = {}
 links = []
 stop_loop = False
 
-# --- FREKVENCIJSKI SLOJ (nezavisan od ML-a) ---
-# Prati koliko JEDINSTVENIH poddomena svaki (pod, osnovni_domen) posalje
-# u kliznom prozoru. Tunelovanje mora da menja poddomene (zbog kesa), pa
-# veliki broj jedinstvenih u kratkom vremenu = sumnjivo. Prag se kalibrise
-# na baseline-u legitimnog saobracaja (ne trenira se).
 import time
 from collections import defaultdict, deque
 
-FREQ_WINDOW = float(os.environ.get("FREQ_WINDOW", "10"))   # sekundi
-FREQ_THRESHOLD = int(os.environ.get("FREQ_THRESHOLD", "15"))  # jedinstvenih poddomena
-
-# kljuc: (cgroup_id, osnovni_domen) -> deque[(timestamp, poddomen)]
+FREQ_WINDOW = float(os.environ.get("FREQ_WINDOW", "10"))  
+FREQ_THRESHOLD = int(os.environ.get("FREQ_THRESHOLD", "15"))  
 freq_state = defaultdict(deque)
-# da ne spamujemo frekvencijski alarm za isti kljuc stalno
+
 freq_alerted = {}
 
-# --- MITRE ATT&CK mapiranje (Helix Kitten / APT34) ---
-# Tehnike koje ovaj alat detektuje, za prikaz u alarmu i prezentaciji.
 MITRE = {
     "ml":   "T1071.004 (Application Layer Protocol: DNS)",
     "txt":  "T1071.004 + T1048 (Exfiltration Over Alternative Protocol)",
-    "freq": "T1048.003 (Exfiltration Over Unencrypted Non-C2 Protocol)",
 }
-# Short codes shown in the dashboard table
 QTYPE_NAMES = {1:"A", 28:"AAAA", 16:"TXT", 5:"CNAME", 10:"NULL",
                15:"MX", 2:"NS", 12:"PTR", 6:"SOA", 33:"SRV", 255:"ANY"}
 def qtype_name(q):
@@ -101,9 +83,7 @@ MITRE_SHORT = {
     "freq": "T1048.003",
 }
 
-# --- DASHBOARD stanje (agregat po podu) ---
 DASHBOARD = os.environ.get("DASHBOARD", "0") == "1"
-# cgroup_id -> dict(ns, pod, queries, max_score, ml_alarms, freq_alarms, last_name, status)
 dash = {}
 start_time = time.time()
 total_events = 0
@@ -126,7 +106,7 @@ def dash_update(cgroup_id, ns, pod, score, name, ml_alarm=False, freq_alarm=Fals
         d["mitre"].update(mitre_tech)
     d["qtypes"][qtype_name(qtype)] += 1
     if d["ml"] and d["freq"]:
-        d["status"] = "HIGH"         # both layers -> strongest signal
+        d["status"] = "HIGH"
     elif d["ml"] or d["freq"]:
         d["status"] = "suspicious"
 
@@ -137,20 +117,17 @@ def base_domain(name: str) -> str:
     return name
 
 def subdomain_part(name: str, base: str) -> str:
-    # deo imena ispred osnovnog domena (tu su zakodirani podaci)
     if name.endswith(base):
         return name[: -len(base)].rstrip(".")
     return name
 
 def freq_check(cgroup_id: int, name: str):
-    """Vraca (okinuo, broj_jedinstvenih, osnovni_domen) za frekvencijski prag."""
     now = time.time()
     base = base_domain(name)
     sub = subdomain_part(name, base)
     key = (cgroup_id, base)
     dq = freq_state[key]
     dq.append((now, sub))
-    # izbaci sve starije od prozora
     cutoff = now - FREQ_WINDOW
     while dq and dq[0][0] < cutoff:
         dq.popleft()
@@ -164,17 +141,6 @@ def on_sigint(signum, frame):
 
 signal.signal(signal.SIGINT, on_sigint)
 
-# --- FEATURE EKSTRAKCIJA (9 feature-a koje model ocekuje) ---
-# Napomena: definicije prate semantiku Mendeley DNS-exfil dataseta.
-#   len               : broj karaktera imena (bez tacaka)
-#   subdomains_count  : broj labela (poddomena), tj. delova izmedju tacaka
-#   w_count           : broj "reci" (maksimalnih nizova slova a-z/A-Z)
-#   w_max             : duzina najduze reci
-#   entropy           : Shannon entropija nad karakterima imena (bez tacaka)
-#   w_max_ratio       : w_max / len
-#   w_count_ratio     : w_count / len
-#   digits_ratio      : udeo cifara u imenu (bez tacaka)
-#   uppercase_ratio   : udeo velikih slova u imenu (bez tacaka)
 def calc_entropy_chars(s: str) -> float:
     if not s:
         return 0.0
@@ -185,10 +151,9 @@ def calc_entropy_chars(s: str) -> float:
 def extract_features(name_bytes: bytes) -> dict:
     name = name_bytes.decode("ascii", errors="ignore")
     labels = [l for l in name.split(".") if l != ""]
-    joined = "".join(labels)                 # ime bez tacaka
+    joined = "".join(labels)
     length = len(joined)
 
-    # reci = maksimalni nizovi slova
     words = []
     cur = 0
     for ch in joined:
@@ -217,8 +182,6 @@ def extract_features(name_bytes: bytes) -> dict:
         "digits_ratio": (digits / length) if length else 0.0,
         "uppercase_ratio": (uppers / length) if length else 0.0,
     }
-
-# Rezervni prag (ako ML nije dostupan): grubo, na osnovu par feature-a.
 def fallback_score(f: dict, is_txt: bool) -> float:
     s = 0.0
     if f["len"] > 40: s += 0.30
@@ -239,11 +202,10 @@ def score_name(name_bytes: bytes, is_txt: bool):
     sc = fallback_score(f, is_txt)
     return sc, sc >= 0.70, f
 
-# --- POD MAPIRANJE ---
 def map_uid_to_pod(uid: str):
     log_pods = "/var/log/pods"
     if not os.path.exists(log_pods):
-        return "nepoznat", "nepoznat"
+        return "unknown", "unknown"
     try:
         for entry in os.listdir(log_pods):
             if uid in entry:
@@ -252,7 +214,7 @@ def map_uid_to_pod(uid: str):
                     return parts[0], parts[1]
     except Exception:
         pass
-    return "nepoznat", "nepoznat"
+    return "unknown", "unknown"
 
 def attach_one(prog, path: str):
     try:
@@ -290,7 +252,6 @@ def attach_all(prog):
                 except OSError:
                     pass
 
-# --- EVENT OBRADA (SAMO MONITORING, BEZ KARANTINA) ---
 def handle_event(ctx, data, size):
     global total_events
     ev = Event.from_address(data)
@@ -307,7 +268,7 @@ def handle_event(ctx, data, size):
 
     techniques = set()
 
-    # --- FREQUENCY LAYER (independent alarm) ---
+
     freq_alarm = False
     freq_hit, uniq, base_dom = freq_check(ev.cgroup_id, name_str)
     if freq_hit and not is_transit:
@@ -331,14 +292,13 @@ def handle_event(ctx, data, size):
     if ml_alarm:
         techniques.add(MITRE_SHORT["txt"] if is_txt else MITRE_SHORT["ml"])
 
-    # update dashboard state (both for alarms and normal traffic)
     if not is_transit:
         dash_update(ev.cgroup_id, ns, pod_name, sc, name_str,
                     ml_alarm=ml_alarm, freq_alarm=freq_alarm, mitre_tech=techniques,
                     qtype=ev.qtype)
 
     if DASHBOARD:
-        return 0   # dashboard mode: no per-line output
+        return 0  
 
     if is_attack:
         if is_transit:
@@ -363,12 +323,10 @@ def handle_event(ctx, data, size):
 
 
 def render_dashboard():
-    """Zivi prikaz tabele preko rich-a; poziva se iz petlje u dashboard modu."""
     from rich.table import Table
     from rich.console import Console
     _ = Console()
-    # Dva reda po podu: 1) glavni info, 2) uvuceni detalji.
-    t = Table(title="DNS Exfiltration Monitor — APT34 / Helix Kitten",
+    t = Table(title="DNS Exfiltration Monitor",
               show_lines=True, expand=False)
     t.add_column("Pod / details", no_wrap=True)
     t.add_column("Queries", justify="right", width=8)
@@ -394,12 +352,9 @@ def render_dashboard():
             podcol = f"{d['ns']}/{d['pod']}"
             mcol = f"[dim]{mitre}[/]"
 
-        # row 1: pod, queries, score, status, mitre
         t.add_row(podcol, str(d["queries"]), f"{d['max_score']:.2f}", st, mcol)
-        # row 2: indented details (ML/Freq + last query)
         details = f"   \\ ML:{d['ml']}  Freq:{d['freq']}  last: {d['last']}"
         t.add_row(f"[dim]{details}[/]", "", "", "", "")
-        # row 3: query-type distribution (A/AAAA/TXT/...)
         qd = "  ".join(f"{k}:{v}" for k, v in d["qtypes"].most_common())
         t.add_row(f"[dim]   \\ types: {qd}[/]", "", "", "", "")
     elapsed = int(time.time() - start_time)
@@ -464,7 +419,6 @@ def main():
 
 
 def print_summary():
-    """Sazetak na kraju: ukupno upita, sumnjivi podovi, po sloju."""
     print("\n" + "=" * 60)
     print("SUMMARY")
     print(f"  Total DNS queries : {total_events}")
