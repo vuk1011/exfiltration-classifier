@@ -62,8 +62,8 @@ stop_loop = False
 import time
 from collections import defaultdict, deque
 
-FREQ_WINDOW = float(os.environ.get("FREQ_WINDOW", "10"))  
-FREQ_THRESHOLD = int(os.environ.get("FREQ_THRESHOLD", "15"))  
+FREQ_WINDOW = float(os.environ.get("FREQ_WINDOW", "30"))  
+FREQ_THRESHOLD = int(os.environ.get("FREQ_THRESHOLD", "3"))  
 freq_state = defaultdict(deque)
 
 freq_alerted = {}
@@ -305,7 +305,7 @@ def handle_event(ctx, data, size):
             print(f"\033[1;33m[TRANSIT via CoreDNS]\033[0m {ns}/{pod_name}  {name_str} (score {sc:.2f})")
         else:
             mitre = MITRE["txt"] if is_txt else MITRE["ml"]
-            print("\033[1;31m[ALERT - APT34 / HELIX KITTEN]\033[0m")
+            print("\033[1;31m[ALERT]\033[0m")
             print(f"  |- Namespace  : {ns}")
             print(f"  |- Pod        : {pod_name}")
             print(f"  |- cgroup_id  : {ev.cgroup_id}")
