@@ -9,6 +9,10 @@ blokira saobracaj (karantin je uklonjen).
     make
 Nastaje: vmlinux.h (iz BTF-a), dns.bpf.o, dns_loader (C varijanta).
 
+## Dashboard (opciono)
+    sudo python3 -m pip install --break-system-packages rich
+    sudo DASHBOARD=1 ML_DIR=../ml-classifier MODEL_PATH=../ml-classifier/model.pkl python3 dns_loader.py
+
 ## Pokretanje (preporuceno: Python + ML)
     sudo ML_DIR=../ml-classifier MODEL_PATH=../ml-classifier/model.pkl \
          python3 dns_loader.py

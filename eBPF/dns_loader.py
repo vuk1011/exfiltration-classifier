@@ -21,11 +21,11 @@ try:
     if os.path.exists(MODEL_PATH):
         classifier = DNSClassifier.load(MODEL_PATH, threshold=THRESHOLD,
                                         feature_extractor=lambda q: extract_features(q.name.encode()))
-        print(f"[ml] model ucitan: {MODEL_PATH} (threshold={THRESHOLD})")
+        print(f"[ml] model loaded: {MODEL_PATH} (threshold={THRESHOLD})")
     else:
-        print(f"[ml] UPOZORENJE: model nije nadjen na {MODEL_PATH}; koristim rezervni prag")
+        print(f"[ml] WARNING: model not found at {MODEL_PATH}; using fallback threshold")
 except Exception as ex:
-    print(f"[ml] UPOZORENJE: ML nedostupan ({ex}); koristim rezervni prag")
+    print(f"[ml] WARNING: ML unavailable ({ex}); using fallback threshold")
 
 # --- CTYPES DEFINICIJE ZA STRUKTURE I LIBBPF ---
 NAME_LEN = 180
@@ -36,6 +36,7 @@ class Event(ctypes.Structure):
         ("name", ctypes.c_uint8 * NAME_LEN),
         ("name_len", ctypes.c_uint16),
         ("qtype_txt", ctypes.c_uint8),
+        ("qtype", ctypes.c_uint16),
     ]
 
 libbpf = ctypes.CDLL("libbpf.so")
@@ -64,6 +65,98 @@ KUBEPODS = "/sys/fs/cgroup/kubepods"
 pods = {}
 links = []
 stop_loop = False
+
+# --- FREKVENCIJSKI SLOJ (nezavisan od ML-a) ---
+# Prati koliko JEDINSTVENIH poddomena svaki (pod, osnovni_domen) posalje
+# u kliznom prozoru. Tunelovanje mora da menja poddomene (zbog kesa), pa
+# veliki broj jedinstvenih u kratkom vremenu = sumnjivo. Prag se kalibrise
+# na baseline-u legitimnog saobracaja (ne trenira se).
+import time
+from collections import defaultdict, deque
+
+FREQ_WINDOW = float(os.environ.get("FREQ_WINDOW", "10"))   # sekundi
+FREQ_THRESHOLD = int(os.environ.get("FREQ_THRESHOLD", "15"))  # jedinstvenih poddomena
+
+# kljuc: (cgroup_id, osnovni_domen) -> deque[(timestamp, poddomen)]
+freq_state = defaultdict(deque)
+# da ne spamujemo frekvencijski alarm za isti kljuc stalno
+freq_alerted = {}
+
+# --- MITRE ATT&CK mapiranje (Helix Kitten / APT34) ---
+# Tehnike koje ovaj alat detektuje, za prikaz u alarmu i prezentaciji.
+MITRE = {
+    "ml":   "T1071.004 (Application Layer Protocol: DNS)",
+    "txt":  "T1071.004 + T1048 (Exfiltration Over Alternative Protocol)",
+    "freq": "T1048.003 (Exfiltration Over Unencrypted Non-C2 Protocol)",
+}
+# Short codes shown in the dashboard table
+QTYPE_NAMES = {1:"A", 28:"AAAA", 16:"TXT", 5:"CNAME", 10:"NULL",
+               15:"MX", 2:"NS", 12:"PTR", 6:"SOA", 33:"SRV", 255:"ANY"}
+def qtype_name(q):
+    return QTYPE_NAMES.get(q, f"T{q}")
+
+MITRE_SHORT = {
+    "ml":   "T1071.004",
+    "txt":  "T1071.004+T1048",
+    "freq": "T1048.003",
+}
+
+# --- DASHBOARD stanje (agregat po podu) ---
+DASHBOARD = os.environ.get("DASHBOARD", "0") == "1"
+# cgroup_id -> dict(ns, pod, queries, max_score, ml_alarms, freq_alarms, last_name, status)
+dash = {}
+start_time = time.time()
+total_events = 0
+
+def dash_update(cgroup_id, ns, pod, score, name, ml_alarm=False, freq_alarm=False, mitre_tech=None, qtype=0):
+    d = dash.get(cgroup_id)
+    if d is None:
+        d = {"ns": ns, "pod": pod, "queries": 0, "max_score": 0.0,
+             "ml": 0, "freq": 0, "last": "", "status": "clean", "mitre": set(),
+             "qtypes": Counter()}
+        dash[cgroup_id] = d
+    d["queries"] += 1
+    d["max_score"] = max(d["max_score"], score)
+    d["last"] = name[:40]
+    if ml_alarm:
+        d["ml"] += 1
+    if freq_alarm:
+        d["freq"] += 1
+    if mitre_tech:
+        d["mitre"].update(mitre_tech)
+    d["qtypes"][qtype_name(qtype)] += 1
+    if d["ml"] and d["freq"]:
+        d["status"] = "HIGH"         # both layers -> strongest signal
+    elif d["ml"] or d["freq"]:
+        d["status"] = "suspicious"
+
+def base_domain(name: str) -> str:
+    labels = [l for l in name.split(".") if l]
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return name
+
+def subdomain_part(name: str, base: str) -> str:
+    # deo imena ispred osnovnog domena (tu su zakodirani podaci)
+    if name.endswith(base):
+        return name[: -len(base)].rstrip(".")
+    return name
+
+def freq_check(cgroup_id: int, name: str):
+    """Vraca (okinuo, broj_jedinstvenih, osnovni_domen) za frekvencijski prag."""
+    now = time.time()
+    base = base_domain(name)
+    sub = subdomain_part(name, base)
+    key = (cgroup_id, base)
+    dq = freq_state[key]
+    dq.append((now, sub))
+    # izbaci sve starije od prozora
+    cutoff = now - FREQ_WINDOW
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+    unique = len({s for _, s in dq})
+    triggered = unique >= FREQ_THRESHOLD
+    return triggered, unique, base
 
 def on_sigint(signum, frame):
     global stop_loop
@@ -142,7 +235,7 @@ def score_name(name_bytes: bytes, is_txt: bool):
             pred = classifier.classify(f)
             return pred.score, pred.is_attack, f
         except Exception as ex:
-            print(f"  [ml] greska u klasifikaciji ({ex}); rezervni prag")
+            print(f"  [ml] classification error ({ex}); using fallback")
     sc = fallback_score(f, is_txt)
     return sc, sc >= 0.70, f
 
@@ -199,71 +292,194 @@ def attach_all(prog):
 
 # --- EVENT OBRADA (SAMO MONITORING, BEZ KARANTINA) ---
 def handle_event(ctx, data, size):
+    global total_events
     ev = Event.from_address(data)
     if not ev.name_len:
         return 0
+    total_events += 1
     raw_name = bytes(ev.name[:ev.name_len])
     is_txt = bool(ev.qtype_txt)
     sc, is_attack, f = score_name(raw_name, is_txt)
     name_str = raw_name.decode("ascii", errors="ignore")
 
-    ns, pod_name = pods.get(ev.cgroup_id, ("nepoznat", "nepoznat"))
+    ns, pod_name = pods.get(ev.cgroup_id, ("unknown", "unknown"))
     is_transit = (ns == "kube-system" and pod_name.startswith("coredns"))
+
+    techniques = set()
+
+    # --- FREQUENCY LAYER (independent alarm) ---
+    freq_alarm = False
+    freq_hit, uniq, base_dom = freq_check(ev.cgroup_id, name_str)
+    if freq_hit and not is_transit:
+        key = (ev.cgroup_id, base_dom)
+        last = freq_alerted.get(key, 0)
+        if time.time() - last > FREQ_WINDOW / 2:
+            freq_alerted[key] = time.time()
+            freq_alarm = True
+            techniques.add(MITRE_SHORT["freq"])
+            if not DASHBOARD:
+                print("\033[1;35m[FREQUENCY - suspicious pattern]\033[0m")
+                print(f"  |- Namespace : {ns}")
+                print(f"  |- Pod       : {pod_name}")
+                print(f"  |- Domain    : {base_dom}")
+                print(f"  |- {uniq} unique subdomains in < {FREQ_WINDOW:.0f}s "
+                      f"(threshold {FREQ_THRESHOLD})")
+                print(f"  \\- MITRE     : {MITRE['freq']}")
+                print()
+
+    ml_alarm = is_attack and not is_transit
+    if ml_alarm:
+        techniques.add(MITRE_SHORT["txt"] if is_txt else MITRE_SHORT["ml"])
+
+    # update dashboard state (both for alarms and normal traffic)
+    if not is_transit:
+        dash_update(ev.cgroup_id, ns, pod_name, sc, name_str,
+                    ml_alarm=ml_alarm, freq_alarm=freq_alarm, mitre_tech=techniques,
+                    qtype=ev.qtype)
+
+    if DASHBOARD:
+        return 0   # dashboard mode: no per-line output
 
     if is_attack:
         if is_transit:
-            print(f"\033[1;33m[TRANZIT kroz CoreDNS]\033[0m {ns}/{pod_name}  {name_str} (skor {sc:.2f})")
+            print(f"\033[1;33m[TRANSIT via CoreDNS]\033[0m {ns}/{pod_name}  {name_str} (score {sc:.2f})")
         else:
-            print("\033[1;31m[ALARM - APT34 / HELIX KITTEN]\033[0m")
-            print(f"  ├─ Namespace : {ns}")
-            print(f"  ├─ Pod       : {pod_name}")
-            print(f"  ├─ cgroup_id : {ev.cgroup_id}")
-            print(f"  ├─ DNS       : {name_str}")
-            print(f"  ├─ TXT upit  : {'da' if is_txt else 'ne'}")
-            print(f"  ├─ Skor      : {sc:.2f}")
-            print(f"  └─ Atributi  : entropija={f['entropy']:.2f} len={f['len']:.0f} "
+            mitre = MITRE["txt"] if is_txt else MITRE["ml"]
+            print("\033[1;31m[ALERT - APT34 / HELIX KITTEN]\033[0m")
+            print(f"  |- Namespace  : {ns}")
+            print(f"  |- Pod        : {pod_name}")
+            print(f"  |- cgroup_id  : {ev.cgroup_id}")
+            print(f"  |- DNS        : {name_str}")
+            print(f"  |- TXT query  : {'yes' if is_txt else 'no'}")
+            print(f"  |- Score      : {sc:.2f}")
+            print(f"  |- Features   : entropy={f['entropy']:.2f} len={f['len']:.0f} "
                   f"w_max={f['w_max']:.0f} subdomains={f['subdomains_count']:.0f} "
-                  f"cifre={f['digits_ratio']:.2f}")
+                  f"digits={f['digits_ratio']:.2f}")
+            print(f"  \\- MITRE      : {mitre}")
             print()
     else:
         print(f"{ns:<12} {pod_name:<30} score={sc:.2f} len={f['len']:.0f} {name_str}")
     return 0
 
+
+def render_dashboard():
+    """Zivi prikaz tabele preko rich-a; poziva se iz petlje u dashboard modu."""
+    from rich.table import Table
+    from rich.console import Console
+    _ = Console()
+    # Dva reda po podu: 1) glavni info, 2) uvuceni detalji.
+    t = Table(title="DNS Exfiltration Monitor — APT34 / Helix Kitten",
+              show_lines=True, expand=False)
+    t.add_column("Pod / details", no_wrap=True)
+    t.add_column("Queries", justify="right", width=8)
+    t.add_column("Score", justify="right", width=6)
+    t.add_column("Status", no_wrap=True, width=12)
+    t.add_column("MITRE ATT&CK", no_wrap=True, width=18)
+
+    rank = {"HIGH": 0, "suspicious": 1, "clean": 2}
+    rows = sorted(dash.values(), key=lambda d: (rank.get(d["status"], 3), -d["max_score"]))
+    for d in rows:
+        status = d["status"]
+        mitre = ", ".join(sorted(d["mitre"])) if d["mitre"] else "-"
+        if status == "HIGH":
+            st = "[bold red]HIGH RISK[/]"
+            podcol = f"[bold red]{d['ns']}/{d['pod']}[/]"
+            mcol = f"[bold red]{mitre}[/]"
+        elif status == "suspicious":
+            st = "[yellow]suspicious[/]"
+            podcol = f"[yellow]{d['ns']}/{d['pod']}[/]"
+            mcol = f"[yellow]{mitre}[/]"
+        else:
+            st = "[green]clean[/]"
+            podcol = f"{d['ns']}/{d['pod']}"
+            mcol = f"[dim]{mitre}[/]"
+
+        # row 1: pod, queries, score, status, mitre
+        t.add_row(podcol, str(d["queries"]), f"{d['max_score']:.2f}", st, mcol)
+        # row 2: indented details (ML/Freq + last query)
+        details = f"   \\ ML:{d['ml']}  Freq:{d['freq']}  last: {d['last']}"
+        t.add_row(f"[dim]{details}[/]", "", "", "", "")
+        # row 3: query-type distribution (A/AAAA/TXT/...)
+        qd = "  ".join(f"{k}:{v}" for k, v in d["qtypes"].most_common())
+        t.add_row(f"[dim]   \\ types: {qd}[/]", "", "", "", "")
+    elapsed = int(time.time() - start_time)
+    t.caption = (f"Queries: {total_events}  ·  Pods: {len(dash)}  ·  "
+                 f"Uptime: {elapsed}s  ·  MITRE: T1071.004 / T1048  ·  Ctrl-C to quit")
+    return t
+
 def main():
     bpf_obj_file = "dns.bpf.o"
     if not os.path.exists(bpf_obj_file):
-        print(f"Greska: {bpf_obj_file} nije pronadjen. Pokreni 'make'.")
+        print(f"Error: {bpf_obj_file} not found. Run 'make'.")
         sys.exit(1)
     obj = libbpf.bpf_object__open_file(bpf_obj_file.encode(), None)
     if not obj:
-        print("Greska: bpf_object__open_file failed"); sys.exit(1)
+        print("Error: bpf_object__open_file failed"); sys.exit(1)
     if libbpf.bpf_object__load(obj) != 0:
-        print("Greska: bpf_object__load failed"); sys.exit(1)
+        print("Error: bpf_object__load failed"); sys.exit(1)
     prog = libbpf.bpf_object__find_program_by_name(obj, b"dns_egress")
     if not prog:
-        print("Greska: Program 'dns_egress' nije pronadjen"); sys.exit(1)
+        print("Error: program 'dns_egress' not found"); sys.exit(1)
 
     attach_all(prog)
     if not pods:
-        print("UPOZORENJE: nijedan pod cgroup nije zakacen", file=sys.stderr)
+        print("WARNING: no pod cgroup was attached", file=sys.stderr)
 
     events_fd = libbpf.bpf_object__find_map_fd_by_name(obj, b"events")
     cb = RINGBUF_CB(handle_event)
     rb = libbpf.ring_buffer__new(events_fd, cb, None, None)
     if not rb:
-        print("Greska: Kreiranje ring_buffer-a nije uspelo"); sys.exit(1)
+        print("Error: ring_buffer creation failed"); sys.exit(1)
 
-    print("Monitoring DNS na izlasku iz podova (Python + ML)... Ctrl-C za kraj")
-    print("-" * 64)
-    try:
-        while not stop_loop:
-            err = libbpf.ring_buffer__poll(rb, 100)
-            if err < 0 and err != -4:
-                break
-    finally:
-        print("\nKraj.")
-        libbpf.ring_buffer__free(rb)
-        libbpf.bpf_object__close(obj)
+    if DASHBOARD:
+        try:
+            from rich.live import Live
+        except ImportError:
+            print("Error: dashboard needs 'rich' (sudo python3 -m pip install "
+                  "--break-system-packages rich). Or run without DASHBOARD=1.")
+            sys.exit(1)
+        try:
+            with Live(render_dashboard(), refresh_per_second=4, screen=True) as live:
+                while not stop_loop:
+                    err = libbpf.ring_buffer__poll(rb, 100)
+                    if err < 0 and err != -4:
+                        break
+                    live.update(render_dashboard())
+        finally:
+            libbpf.ring_buffer__free(rb)
+            libbpf.bpf_object__close(obj)
+            print_summary()
+    else:
+        print("Monitoring DNS egress from pods (Python + ML)... Ctrl-C to quit")
+        print("-" * 64)
+        try:
+            while not stop_loop:
+                err = libbpf.ring_buffer__poll(rb, 100)
+                if err < 0 and err != -4:
+                    break
+        finally:
+            libbpf.ring_buffer__free(rb)
+            libbpf.bpf_object__close(obj)
+            print_summary()
+
+
+def print_summary():
+    """Sazetak na kraju: ukupno upita, sumnjivi podovi, po sloju."""
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print(f"  Total DNS queries : {total_events}")
+    print(f"  Pods monitored    : {len(dash)}")
+    suspicious = [d for d in dash.values() if d["status"] != "clean"]
+    print(f"  Suspicious pods   : {len(suspicious)}")
+    for d in sorted(suspicious, key=lambda x: -x["max_score"]):
+        mitre = ", ".join(sorted(d["mitre"])) if d["mitre"] else "-"
+        qd = " ".join(f"{k}:{v}" for k, v in d["qtypes"].most_common())
+        print(f"    - {d['ns']}/{d['pod']}: status={d['status']} "
+              f"max_score={d['max_score']:.2f} ML_alarms={d['ml']} freq_alarms={d['freq']} "
+              f"MITRE=[{mitre}]")
+        print(f"        query types: {qd}")
+    print("  MITRE ATT&CK      : T1071.004 (DNS C2), T1048 (Exfiltration)")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()

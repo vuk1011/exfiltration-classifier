@@ -17,7 +17,8 @@ struct event {
     __u64 cgroup_id;
     __u8  name[NAME_LEN];
     __u16 name_len;
-    __u8  qtype_txt;         // 1 ako je TXT upit (APT34 voli TXT)
+    __u8  qtype_txt;         // 1 ako je TXT upit (zadrzano za kompatibilnost)
+    __u16 qtype;            // pun QTYPE: 1=A, 28=AAAA, 16=TXT, 5=CNAME, 10=NULL, 15=MX...
 };
 
 struct {
@@ -101,6 +102,7 @@ int dns_egress(struct __sk_buff *skb)
     __builtin_memset(ev->name, 0, sizeof(ev->name));
     ev->name_len = 0;
     ev->qtype_txt = 0;
+    ev->qtype = 0;
 
     __u32 dns_off = ihl + sizeof(struct udphdr);      // pocetak DNS poruke
     __u32 qname_off = dns_off + DNS_HDR;               // pocetak imena
@@ -147,12 +149,17 @@ int dns_egress(struct __sk_buff *skb)
     }
     ev->name_len = out;
 
-    // Posle imena (na raw[i]) sledi 0x00, pa QTYPE (2 bajta). TXT = 16.
-    if (i + 3 < RAW_LEN) {
-        __u8 t_hi = raw[(i + 1) & (RAW_LEN - 1)];
-        __u8 t_lo = raw[(i + 2) & (RAW_LEN - 1)];
-        if (t_hi == 0 && t_lo == 16)
-            ev->qtype_txt = 1;
+    // QTYPE je uvek poslednja 4 bajta pitanja: ... <ime> 00 QTYPE(2) QCLASS(2).
+    // Citamo sa KRAJA paketa (skb->len - 4), pa radi i za duga imena koja
+    // popune bafer (gde citanje posle imena ne bi stiglo do QTYPE-a).
+    __u32 qlen = skb->len;
+    if (qlen >= 4) {
+        __u8 qt[2];
+        if (bpf_skb_load_bytes(skb, qlen - 4, qt, 2) == 0) {
+            ev->qtype = ((__u16)qt[0] << 8) | qt[1];
+            if (ev->qtype == 16)
+                ev->qtype_txt = 1;
+        }
     }
 
     bump(3);                      // poslato u ringbuf
