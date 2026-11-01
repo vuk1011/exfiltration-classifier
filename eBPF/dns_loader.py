@@ -12,7 +12,7 @@ THRESHOLD = float(os.environ.get("THRESHOLD", "0.5"))
 classifier = None
 try:
     sys.path.insert(0, ML_DIR)
-    from classifier import DNSClassifier, DNSQuery  # noqa: E402
+    from classifier import DNSClassifier, DNSQuery 
     if os.path.exists(MODEL_PATH):
         classifier = DNSClassifier.load(MODEL_PATH, threshold=THRESHOLD,
                                         feature_extractor=lambda q: extract_features(q.name.encode()))
@@ -63,7 +63,7 @@ import time
 from collections import defaultdict, deque
 
 FREQ_WINDOW = float(os.environ.get("FREQ_WINDOW", "30"))  
-FREQ_THRESHOLD = int(os.environ.get("FREQ_THRESHOLD", "3"))  
+FREQ_THRESHOLD = int(os.environ.get("FREQ_THRESHOLD", "7"))  
 freq_state = defaultdict(deque)
 
 freq_alerted = {}
@@ -123,17 +123,15 @@ def subdomain_part(name: str, base: str) -> str:
 
 def freq_check(cgroup_id: int, name: str):
     now = time.time()
-    base = base_domain(name)
-    sub = subdomain_part(name, base)
-    key = (cgroup_id, base)
+    key = cgroup_id
     dq = freq_state[key]
-    dq.append((now, sub))
+    dq.append((now, name))
     cutoff = now - FREQ_WINDOW
     while dq and dq[0][0] < cutoff:
         dq.popleft()
-    unique = len({s for _, s in dq})
+    unique = len({n for _, n in dq})
     triggered = unique >= FREQ_THRESHOLD
-    return triggered, unique, base
+    return triggered, unique, "lab-zone"
 
 def on_sigint(signum, frame):
     global stop_loop
@@ -272,7 +270,7 @@ def handle_event(ctx, data, size):
     freq_alarm = False
     freq_hit, uniq, base_dom = freq_check(ev.cgroup_id, name_str)
     if freq_hit and not is_transit:
-        key = (ev.cgroup_id, base_dom)
+        key = ev.cgroup_id
         last = freq_alerted.get(key, 0)
         if time.time() - last > FREQ_WINDOW / 2:
             freq_alerted[key] = time.time()
@@ -432,7 +430,7 @@ def print_summary():
               f"max_score={d['max_score']:.2f} ML_alarms={d['ml']} freq_alarms={d['freq']} "
               f"MITRE=[{mitre}]")
         print(f"        query types: {qd}")
-    print("  MITRE ATT&CK      : T1071.004 (DNS C2), T1048 (Exfiltration)")
+    print("  MITRE ATT&CK      : T1048 (Exfiltration)")
     print("=" * 60)
 
 if __name__ == "__main__":
